@@ -1,0 +1,22 @@
+{
+  "entries": {
+    "c097181be9f3339b55daea4d05fd6514c00b76ad3e05cda54eb66c1deab9274b": {
+      "hash": "c097181be9f3339b55daea4d05fd6514c00b76ad3e05cda54eb66c1deab9274b",
+      "localPath": "/data/data/com.termux/files/home/Youtube/youtube-automation-agent/data/test-asset-cache/files/c097181be9f3339b55daea4d05fd6514c00b76ad3e05cda54eb66c1deab9274b.bin",
+      "sizeBytes": 31,
+      "provider": "test",
+      "providerAssetId": null,
+      "sourceUrl": null,
+      "pageUrl": null,
+      "creator": null,
+      "license": "CC0",
+      "licenseUrl": null,
+      "mediaType": "image",
+      "width": null,
+      "height": null,
+      "durationSeconds": null,
+      "downloadedAt": "2026-09-04T22:08:59.749Z",
+      "lastUsedAt": "2026-09-04T22:08:59.776Z"
+    }
+  }
+}

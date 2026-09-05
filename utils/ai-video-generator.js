@@ -472,38 +472,48 @@ class AIVideoGenerator {
       throw new Error(ffmpegInstallHint());
     }
 
-    const { chromium } = require('playwright');
-    const browser = await chromium.launch();
     const slidesDir = path.join(path.dirname(outputPath), 'slides');
 
     try {
-      const page = await browser.newPage();
-      await page.setViewportSize({ width: 1920, height: 1080 });
+      let stills;
+      if (process.platform === 'android') {
+        // Playwright's bundled Chromium cannot run on Android. Render the same
+        // slide deck with sharp (libvips SVG + Pango text) instead.
+        stills = await this.renderSlidesWithSharp(script, visualAssets, slidesDir);
+      } else {
+        const { chromium } = require('playwright');
+        const browser = await chromium.launch();
+        try {
+          const page = await browser.newPage();
+          await page.setViewportSize({ width: 1920, height: 1080 });
 
-      // Create HTML for slideshow (only real image files can be embedded)
-      const imageAssets = await this.filterImageAssets(visualAssets);
-      await page.setContent(this.createSlideshowHTML(script, imageAssets));
+          // Create HTML for slideshow (only real image files can be embedded)
+          const imageAssets = await this.filterImageAssets(visualAssets);
+          await page.setContent(this.createSlideshowHTML(script, imageAssets));
 
-      // Freeze CSS transitions/animations so each still is captured fully rendered
-      await page.addStyleTag({ content: '* { transition: none !important; animation: none !important; }' });
-      await page.waitForTimeout(1000); // Wait for assets to load
+          // Freeze CSS transitions/animations so each still is captured fully rendered
+          await page.addStyleTag({ content: '* { transition: none !important; animation: none !important; }' });
+          await page.waitForTimeout(1000); // Wait for assets to load
 
-      // Capture ONE still per slide instead of screenshotting at 30fps —
-      // FFmpeg turns the stills into a crossfaded video in seconds.
-      const slideCount = await page.evaluate(() => document.querySelectorAll('.slide').length);
-      await fs.mkdir(slidesDir, { recursive: true });
+          // Capture ONE still per slide instead of screenshotting at 30fps —
+          // FFmpeg turns the stills into a crossfaded video in seconds.
+          const slideCount = await page.evaluate(() => document.querySelectorAll('.slide').length);
 
-      const stills = [];
-      for (let i = 0; i < slideCount; i++) {
-        await page.evaluate((index) => {
-          document.querySelectorAll('.slide').forEach((slide, s) => {
-            slide.classList.toggle('active', s === index);
-          });
-        }, i);
+          stills = [];
+          for (let i = 0; i < slideCount; i++) {
+            await page.evaluate((index) => {
+              document.querySelectorAll('.slide').forEach((slide, s) => {
+                slide.classList.toggle('active', s === index);
+              });
+            }, i);
 
-        const stillPath = path.join(slidesDir, `slide_${String(i).padStart(3, '0')}.png`);
-        await page.screenshot({ path: stillPath });
-        stills.push(stillPath);
+            const stillPath = path.join(slidesDir, `slide_${String(i).padStart(3, '0')}.png`);
+            await page.screenshot({ path: stillPath });
+            stills.push(stillPath);
+          }
+        } finally {
+          await browser.close().catch(() => {});
+        }
       }
 
       const videoPath = outputPath.replace('.mp4', '_visual.mp4');
@@ -515,9 +525,116 @@ class AIVideoGenerator {
 
       return outputPath;
     } finally {
-      await browser.close().catch(() => {});
       await this.cleanupDirectory(slidesDir);
     }
+  }
+
+  wrapSvgText(text, maxCharsPerLine, maxLines) {
+    const words = String(text || '').split(/\s+/).filter(Boolean);
+    const lines = [];
+    let current = '';
+    for (const word of words) {
+      const candidate = current ? `${current} ${word}` : word;
+      if (candidate.length <= maxCharsPerLine) {
+        current = candidate;
+      } else {
+        if (current) lines.push(current);
+        current = word;
+        if (lines.length >= maxLines) break;
+      }
+    }
+    if (current && lines.length < maxLines) lines.push(current);
+    if (lines.length === maxLines && words.join(' ').length > lines.join(' ').length) {
+      lines[maxLines - 1] = `${lines[maxLines - 1].slice(0, Math.max(0, maxCharsPerLine - 3))}...`;
+    }
+    return lines;
+  }
+
+  escapeSvgText(text) {
+    return String(text || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  svgTextBlock(lines, fontSize, fill, fontWeight = 'normal') {
+    if (!lines.length) return '';
+    const lineHeight = Math.round(fontSize * 1.3);
+    const blockHeight = lines.length * lineHeight;
+    const startY = 540 - blockHeight / 2 + fontSize;
+    return lines
+      .map((line, i) => `<text x="960" y="${startY + i * lineHeight}" font-family="DejaVu Sans" font-size="${fontSize}" font-weight="${fontWeight}" fill="${fill}" text-anchor="middle">${this.escapeSvgText(line)}</text>`)
+      .join('');
+  }
+
+  async renderSlidesWithSharp(script, visualAssets, slidesDir) {
+    await fs.mkdir(slidesDir, { recursive: true });
+    const imageAssets = await this.filterImageAssets(visualAssets);
+    const gradient = `<defs><linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#667eea"/><stop offset="100%" stop-color="#764ba2"/></linearGradient></defs><rect width="1920" height="1080" fill="url(#bg)"/>`;
+
+    const decodeDataUri = (uri) => {
+      const commaIndex = uri.indexOf(',');
+      return commaIndex >= 0 ? Buffer.from(uri.slice(commaIndex + 1), 'base64') : null;
+    };
+
+    const renderSlide = async (textSvg, imageIndex, slideIndex) => {
+      const baseSvg = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080">${gradient}</svg>`);
+      let base = sharp(baseSvg);
+
+      const imageData = imageIndex >= 0 && imageAssets[imageIndex] ? decodeDataUri(imageAssets[imageIndex]) : null;
+      if (imageData) {
+        const overlay = await sharp(imageData)
+          .resize(1920, 1080, { fit: 'cover' })
+          .ensureAlpha(0.3)
+          .png()
+          .toBuffer();
+        base = sharp(await base.composite([{ input: overlay }]).png().toBuffer());
+      }
+
+      const textLayer = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080">${textSvg}</svg>`);
+      const stillPath = path.join(slidesDir, `slide_${String(slideIndex).padStart(3, '0')}.png`);
+      await base.composite([{ input: textLayer }]).png().toFile(stillPath);
+      return stillPath;
+    };
+
+    let slideIndex = 0;
+    let stills = [];
+
+    // Title slide (mirrors createSlideshowHTML)
+    const titleLines = this.wrapSvgText(script.title, 38, 4);
+    const titleSvg = `<rect width="1920" height="1080" fill="rgba(0,0,0,0.25)"/>${this.svgTextBlock(titleLines, 72, '#ffffff', 'bold')}${this.svgTextBlock(['Ethereal Dreamscript'], 36, 'rgba(255,255,255,0.85)')}`;
+    stills.push(await renderSlide(titleSvg, 0, slideIndex++));
+
+    // Content slides (mirrors generateContentSlides/formatSectionContent)
+    const sections = script.mainContent && Array.isArray(script.mainContent.sections) ? script.mainContent.sections : [];
+    sections.forEach((section, index) => {
+      const assetIndex = Math.min(index + 1, imageAssets.length - 1);
+      const lines = [];
+      if (section.items && Array.isArray(section.items)) {
+        section.items.slice(0, 3).forEach(item => lines.push(`${item.number}. ${item.title}`));
+      } else if (section.steps && Array.isArray(section.steps)) {
+        section.steps.slice(0, 3).forEach(step => lines.push(step.title));
+      } else if (typeof section.content === 'string') {
+        lines.push(section.content.slice(0, 200) + (section.content.length > 200 ? '...' : ''));
+      } else {
+        lines.push('Content coming soon...');
+      }
+
+      const textSvg =
+        `<rect width="1920" height="1080" fill="rgba(0,0,0,0.25)"/>` +
+        this.svgTextBlock(this.wrapSvgText(section.title, 52, 3), 48, '#ffffff', 'bold') +
+        this.svgTextBlock(this.wrapSvgText(lines.join('  •  '), 62, 6), 36, 'rgba(255,255,255,0.95)');
+      stills.push(renderSlide(textSvg, assetIndex, slideIndex++));
+    });
+    stills = await Promise.all(stills);
+
+    // Subscribe slide (mirrors createSlideshowHTML; no emoji — DejaVu has no color glyphs)
+    const subscribeSvg = this.svgTextBlock(['Subscribe for More Stories'], 48, '#ffffff', 'bold') +
+      this.svgTextBlock(['New content daily at 2:00 PM'], 36, 'rgba(255,255,255,0.95)');
+    stills.push(await renderSlide(subscribeSvg, -1, slideIndex++));
+
+    return stills;
   }
 
   async renderSlidesToVideo(stills, totalDuration, videoPath) {

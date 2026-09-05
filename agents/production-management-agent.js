@@ -91,17 +91,11 @@ class ProductionManagementAgent {
       // Save to database
       await this.db.saveProductionData(productionData);
       
-      // Generate video content
-      await this.generateVideoContent(productionData);
-      
-      // Generate audio narration
-      await this.generateAudioNarration(productionData);
-      
-      // Generate captions
-      await this.generateCaptions(productionData);
-      
-      // Final assembly
-      await this.assembleVideo(productionData);
+      // Professional pipeline (content-type aware): classification → visual plan →
+      // narration timing → scene captions → composition. Each stage falls back
+      // to the legacy path individually so existing behavior is preserved
+      // whenever a stage fails.
+      await this.processProfessionalPipeline(productionData);
 
       // Persist a scene-addressable production manifest for selective review and repair.
       await this.sceneRepair.initializeProduction(productionData, this.aiVideoGenerator.lastVideoResult || {});
@@ -703,6 +697,410 @@ class ProductionManagementAgent {
     };
     
     return audioPath + '.info';
+  }
+
+  // =====================================================================
+  // Professional production pipeline (content-type aware)
+  // =====================================================================
+
+  async processProfessionalPipeline(productionData) {
+    const { ContentClassifier } = require('../utils/content-classifier');
+
+    // ---- Stage 1: classification (content type drives every strategy) ----
+    let classification = productionData.strategy?.classification || null;
+    if (!classification) {
+      try {
+        const classifier = new ContentClassifier();
+        classification = await classifier.classify({
+          topic: productionData.script?.title || productionData.strategy?.topic || null,
+          instructions: productionData.strategy?.angle || null
+        });
+      } catch (error) {
+        this.logger.warn('Fallback classification failed:', error.message);
+      }
+    }
+    if (classification) {
+      productionData.contentType = classification.contentType;
+      productionData.classification = classification;
+      productionData.aspectRatio = classification.aspectRatio || '16:9';
+      this.logger.info(`Content type: ${classification.contentType} (confidence ${classification.confidence}, via ${classification.classifier}, aspect ${productionData.aspectRatio})`);
+    } else {
+      productionData.contentType = 'long_form';
+    }
+
+    // ---- Stage 2: narration FIRST (its real duration drives the visuals) ----
+    await this.generateAudioNarration(productionData);
+    let timeline = null;
+    try {
+      timeline = await this.buildNarrationTimeline(productionData);
+    } catch (error) {
+      this.logger.warn('Narration timing failed; falling back to estimated timeline:', error.message);
+    }
+
+    // ---- Stage 3: visual plan (licensed stock first, AI fallback) ----
+    let visualPlan = null;
+    try {
+      visualPlan = await this.buildVisualPlan(productionData, classification, timeline);
+    } catch (error) {
+      this.logger.warn('Visual planning failed; using legacy AI visuals:', error.message);
+      await this.generateVideoContent(productionData);
+    }
+
+    // ---- Stage 4: scene-accurate captions + full-video SRT ----
+    let captionSrts = null;
+    try {
+      captionSrts = await this.buildSceneCaptions(productionData, visualPlan, timeline);
+    } catch (error) {
+      this.logger.warn('Scene captions failed; using legacy captions:', error.message);
+      await this.generateCaptions(productionData);
+    }
+
+    // ---- Stage 5: composition (professional compositor, legacy fallback) ----
+    let composed = false;
+    if (visualPlan && timeline) {
+      try {
+        composed = await this.composeProfessionalVideo(productionData, visualPlan, timeline, captionSrts);
+      } catch (error) {
+        this.logger.warn('Professional composition failed; using legacy assembly:', error.message);
+      }
+    }
+    if (!composed) {
+      await this.assembleVideo(productionData);
+    }
+  }
+
+  /**
+   * Measure the real narration audio and derive per-scene timing from the
+   * actual waveform (silence-aware). Every downstream duration comes from the
+   * narration instead of word-count estimates.
+   */
+  async buildNarrationTimeline(productionData) {
+    const { probeMediaDuration, runFFmpeg } = require('../utils/ffmpeg');
+    const { scriptScenes } = require('../utils/scene-repair-service');
+    const audioPath = productionData.assets.audio?.path;
+    if (!audioPath || productionData.assets.audio?.status !== 'ready') return null;
+
+    const realDuration = await probeMediaDuration(audioPath);
+    if (!realDuration || realDuration < 2) return null;
+    productionData.assets.audio.duration = Number(realDuration.toFixed(2));
+    productionData.assets.audio.durationMeasured = true;
+
+    // Detect speech gaps so scene cuts land on natural pauses.
+    let silences = [];
+    try {
+      const { stderr } = await runFFmpeg([
+        '-i', String(audioPath),
+        '-af', 'silencedetect=noise=-32dB:d=0.30',
+        '-f', 'null', '-'
+      ]);
+      const out = String(stderr || '');
+      const starts = [...out.matchAll(/silence_start:\s*([0-9.]+)/g)].map(m => parseFloat(m[1]));
+      const ends = [...out.matchAll(/silence_end:\s*([0-9.]+)/g)].map(m => parseFloat(m[1]));
+      silences = starts.map((start, i) => ({ start, end: ends[i] !== undefined ? ends[i] : Math.min(start + 0.6, realDuration) }));
+    } catch (error) {
+      this.logger.warn('silencedetect failed; using proportional timing:', error.message);
+    }
+
+    const blueprints = scriptScenes(productionData.script || {});
+    if (!blueprints.length) return null;
+
+    // Word-share estimate per scene, then snap boundaries to nearby silences.
+    const wordCounts = blueprints.map(b => Math.max(1, String(b.scriptText || '').split(/\s+/).filter(Boolean).length));
+    const totalWords = wordCounts.reduce((a, b) => a + b, 0);
+    const usable = Math.max(0.5, realDuration - 0.05);
+    const boundaries = [];
+    let cumulativeWords = 0;
+    for (let i = 0; i < wordCounts.length - 1; i++) {
+      cumulativeWords += wordCounts[i];
+      const ideal = (cumulativeWords / totalWords) * usable;
+      const window = Math.max(2.5, realDuration * 0.12);
+      const candidates = silences
+        .map(s => ({ midpoint: (s.start + s.end) / 2, gap: Math.abs((s.start + s.end) / 2 - ideal) }))
+        .filter(c => c.gap <= window)
+        .sort((a, b) => a.gap - b.gap);
+      const previous = boundaries[boundaries.length - 1] || 0;
+      const chosen = candidates.length ? candidates[0].midpoint : ideal;
+      boundaries.push(Math.max(previous + 1.0, Math.min(usable - 1.0, Number(chosen.toFixed(2)))));
+    }
+
+    // Slice narration per scene (exact alignment for the compositor).
+    const sceneAudioDir = path.join(__dirname, '..', 'data', 'audio', 'scenes', productionData.id);
+    await fs.mkdir(sceneAudioDir, { recursive: true });
+    const scenes = [];
+    let sliceStart = 0;
+    for (let i = 0; i < wordCounts.length; i++) {
+      const end = i < boundaries.length ? boundaries[i] : realDuration;
+      const duration = Math.max(1.0, end - sliceStart);
+      const audioPath2 = path.join(sceneAudioDir, `${String(i).padStart(3, '0')}_base.mp3`);
+      await runFFmpeg(['-y', '-i', String(audioPath), '-ss', sliceStart.toFixed(2), '-t', duration.toFixed(2), '-c:a', 'libmp3lame', '-q:a', '4', audioPath2]);
+      scenes.push({
+        position: i,
+        label: blueprints[i].label,
+        scriptText: blueprints[i].scriptText,
+        start: Number(sliceStart.toFixed(2)),
+        end: Number(end.toFixed(2)),
+        duration: Number(duration.toFixed(2)),
+        audioPath: audioPath2,
+        realAudio: true,
+        boundarySource: i < boundaries.length && silences.some(s => Math.abs((s.start + s.end) / 2 - boundaries[i]) < 0.05) ? 'silence_aligned' : 'proportional'
+      });
+      sliceStart = end;
+    }
+
+    const timeline = {
+      totalDuration: Number(realDuration.toFixed(2)),
+      scenes,
+      silenceBoundaries: silences.length,
+      measured: true
+    };
+    productionData.assets.audio.sceneTimeline = {
+      measured: true,
+      totalDuration: timeline.totalDuration,
+      sceneCount: scenes.length,
+      silenceAligned: scenes.filter(s => s.boundarySource === 'silence_aligned').length
+    };
+    this.logger.info(`Narration timeline: ${scenes.length} scenes over ${timeline.totalDuration}s (${timeline.silenceBoundaries} silences detected, ${timeline.scenes.filter(s => s.boundarySource === 'silence_aligned').length} aligned)`);
+    return timeline;
+  }
+
+  /**
+   * Plan visuals per scene: licensed stock/open assets first, AI image
+   * generation only as fallback. Writes the license manifest.
+   */
+  async buildVisualPlan(productionData, classification, timeline) {
+    const { VisualPlanner } = require('../utils/visual-planner');
+    const { VisualSearchEngine } = require('../utils/visual-search');
+    const { VisualQC } = require('../utils/visual-qc');
+    const { Logger } = require('../utils/logger');
+
+    const plannerContext = classification || { contentType: 'explainer', typeId: 'explainer', visualStrategy: {} };
+    const orientation = productionData.aspectRatio === '9:16' ? 'portrait' : 'landscape';
+
+    const search = new VisualSearchEngine();
+    const planner = new VisualPlanner({
+      visualSearch: search,
+      aiTextService: this.getPlanningTextService(),
+      logger: new Logger('VisualPlanner')
+    });
+
+    const plan = await planner.plan(productionData.script, plannerContext, {
+      productionId: productionData.id,
+      orientation
+    });
+
+    // AI fallback per scene that had no usable stock/open asset. Only a REAL,
+    // decodable image counts — simulation placeholders (.info) do not.
+    for (const scene of plan.scenes) {
+      if (scene.status !== 'needs_generation') continue;
+      try {
+        const assets = await this.aiVideoGenerator.generateVisualAssets(scene.aiPrompt, 'cinematic', 1);
+        const candidate = assets && assets.length ? assets[0] : null;
+        if (candidate && await this.isRealImageFile(candidate)) {
+          scene.assetPath = candidate;
+          scene.status = 'ready';
+          scene.assetOrigin = 'ai_fallback';
+        } else {
+          this.logger.warn(`AI visual fallback for scene ${scene.position} produced no real image — scene will use the compositor's gradient background`);
+        }
+      } catch (error) {
+        this.logger.warn(`AI visual fallback failed for scene ${scene.position}: ${error.message}`);
+      }
+    }
+
+    // Quality control pass (per-scene issues, never blocks — gradient scenes
+    // remain a legitimate visual fallback inside the compositor).
+    const qc = new VisualQC({ logger: new Logger('VisualQC') });
+    const qcResult = await qc.validatePlan(plan, { scenes: timeline ? timeline.scenes : [] });
+    productionData.assets.visualQc = qcResult.summary;
+    if (!qcResult.ok) {
+      this.logger.warn('Visual QC issues:\n' + qc.formatReport(qcResult));
+    } else {
+      this.logger.info(`Visual QC PASS: ${qcResult.summary.scenes} scenes (${qcResult.summary.stock} stock, ${qcResult.summary.ai} AI)`);
+    }
+
+    // License manifest on disk (per operator rules).
+    const manifestDir = path.join(__dirname, '..', 'data', 'asset-manifests');
+    await fs.mkdir(manifestDir, { recursive: true });
+    const manifestPath = path.join(manifestDir, `${productionData.id}.json`);
+    await fs.writeFile(manifestPath, JSON.stringify({
+      productionId: productionData.id,
+      generatedAt: new Date().toISOString(),
+      classification: {
+        contentType: plannerContext.contentType,
+        aspectRatio: productionData.aspectRatio
+      },
+      stats: plan.stats,
+      scenes: plan.scenes
+    }, null, 2));
+
+    productionData.assets.visualPlan = {
+      manifestPath,
+      stats: plan.stats,
+      qc: qcResult.summary,
+      scenes: plan.scenes.map(scene => ({
+        position: scene.position,
+        label: scene.label,
+        visualQuery: scene.visualQuery,
+        assetType: scene.assetType,
+        assetPath: scene.assetPath,
+        assetOrigin: scene.assetOrigin,
+        provider: scene.provider || null,
+        license: scene.license || null,
+        licenseUrl: scene.licenseUrl || null,
+        creator: scene.creator || null,
+        pageUrl: scene.pageUrl || null,
+        sourceUrl: scene.sourceUrl || null,
+        motion: scene.motion,
+        status: scene.status
+      }))
+    };
+
+    productionData.assets.video = {
+      visualAssets: plan.scenes.filter(s => s.assetPath).map(s => s.assetPath),
+      duration: timeline ? timeline.totalDuration : productionData.estimatedDuration,
+      format: 'mp4',
+      resolution: productionData.aspectRatio === '9:16' ? '1080x1920' : '1920x1080',
+      fps: 30,
+      generatedWith: 'pro_visual_pipeline',
+      licensedSources: plan.stats.stock
+    };
+    productionData.timeline.videoGenerated = new Date().toISOString();
+    return plan;
+  }
+
+  /** Per-scene narration-synced captions + full-video SRT (one text layer). */
+  async buildSceneCaptions(productionData, visualPlan, timeline) {
+    const { CaptionEngine } = require('../utils/captions');
+    const engine = new CaptionEngine();
+    const granularity = productionData.classification?.editingStyle?.captions === 'word'
+      ? 'word'
+      : productionData.classification?.editingStyle?.captions === 'sentence' ? 'sentence' : 'phrase';
+    const aspectRatio = productionData.aspectRatio || '16:9';
+
+    const captionsDir = path.join(__dirname, '..', 'data', 'captions', productionData.id);
+    await fs.mkdir(captionsDir, { recursive: true });
+
+    const scenes = visualPlan ? visualPlan.scenes : [];
+    const timing = timeline ? timeline.scenes : [];
+    const sceneSrts = [];
+    const fullEvents = [];
+    const validationSummary = { scenes: 0, valid: 0, issues: [] };
+
+    for (const [index, scene] of scenes.entries()) {
+      const sceneTiming = timing[index];
+      const duration = sceneTiming ? sceneTiming.duration : (scene.duration || 4);
+      const text = sceneTiming ? sceneTiming.scriptText : scene.scriptText;
+      const { events, srt, validation } = engine.buildSceneCaptions(text, duration, { granularity, aspectRatio });
+
+      const srtPath = path.join(captionsDir, `scene_${String(index).padStart(3, '0')}.srt`);
+      await fs.writeFile(srtPath, srt);
+      sceneSrts.push({ position: index, srtPath, eventCount: events.length, valid: validation.ok });
+
+      // Offset events to the full-video timeline for the upload SRT.
+      const offset = sceneTiming ? sceneTiming.start : 0;
+      for (const event of events) {
+        fullEvents.push({ ...event, start: Number((event.start + offset).toFixed(3)), end: Number((event.end + offset).toFixed(3)) });
+      }
+      validationSummary.scenes += 1;
+      if (validation.ok) validationSummary.valid += 1;
+      else validationSummary.issues.push({ scene: index, issues: validation.issues });
+    }
+
+    const fullSrtPath = path.join(__dirname, '..', 'data', 'captions', `${productionData.id}_captions.srt`);
+    await fs.mkdir(path.dirname(fullSrtPath), { recursive: true });
+    await fs.writeFile(fullSrtPath, engine.toSRT(fullEvents));
+
+    productionData.assets.captions = {
+      path: fullSrtPath,
+      format: 'srt',
+      language: 'en',
+      autoGenerated: true,
+      narrationSynced: Boolean(timeline),
+      granularity,
+      sceneCaptions: sceneSrts,
+      validation: validationSummary
+    };
+    productionData.timeline.captionsGenerated = new Date().toISOString();
+    this.logger.info(`Captions: ${fullEvents.length} events across ${scenes.length} scenes (${validationSummary.valid}/${validationSummary.scenes} scenes valid)`);
+    return sceneSrts;
+  }
+
+  /** Compose the final video with the professional compositor. */
+  async composeProfessionalVideo(productionData, visualPlan, timeline, captionSrts) {
+    const { ProfessionalCompositor } = require('../utils/compositor');
+    const finalVideoPath = path.join(__dirname, '..', 'data', 'videos', `${productionData.id}_final.mp4`);
+
+    const captionByPosition = new Map((captionSrts || []).map(entry => [entry.position, entry.srtPath]));
+    const editingStyle = productionData.classification?.editingStyle || {};
+    const compositionScenes = visualPlan.scenes.map((scene, index) => ({
+      assetPath: scene.assetPath,
+      assetType: scene.assetType === 'stock_video' ? 'stock_video' : 'stock_image',
+      motion: scene.motion,
+      label: scene.label,
+      title: index === 0 ? productionData.script.title : null,
+      narrationAudioPath: timeline.scenes[index] ? timeline.scenes[index].audioPath : null,
+      duration: timeline.scenes[index] ? timeline.scenes[index].duration : (scene.duration || 4),
+      captionSrtPath: captionByPosition.get(index) || null,
+      editingStyle,
+      overlayData: { itemNumber: scene.overlayNumber || null }
+    }));
+
+    const compositor = new ProfessionalCompositor({
+      musicPath: process.env.MUSIC_PATH || null,
+      musicVolume: process.env.MUSIC_VOLUME ? Number(process.env.MUSIC_VOLUME) : undefined
+    });
+    const result = await compositor.compose({
+      scenes: compositionScenes,
+      aspectRatio: productionData.aspectRatio || '16:9',
+      transition: (productionData.classification?.pacingStyle?.transition === 'hard_cut') ? 'none' : 'crossfade',
+      outputPath: finalVideoPath,
+      totalDuration: timeline.totalDuration
+    });
+
+    const stats = await fs.stat(result.outputPath);
+    productionData.assets.finalVideo = {
+      path: result.outputPath,
+      fileSize: stats.size,
+      duration: timeline.totalDuration,
+      generatedWith: 'pro_compositor',
+      resolution: productionData.aspectRatio === '9:16' ? '1080x1920' : '1920x1080',
+      format: 'mp4',
+      provider: { actualProvider: 'pro_compositor', scenes: compositionScenes.length, transition: productionData.classification?.pacingStyle?.transition || 'crossfade' }
+    };
+    productionData.containsSyntheticMedia = true; // composed visuals + narration
+    this.logger.info(`Professional composition complete: ${result.outputPath} (${Math.round(stats.size / 1024)} KiB, ${compositionScenes.length} scenes)`);
+    return true;
+  }
+
+  /** True only when the path exists, has an image extension AND decodes via sharp. */
+  async isRealImageFile(candidatePath) {
+    try {
+      if (!/\.(png|jpe?g|webp|gif|tiff?)$/i.test(String(candidatePath))) return false;
+      const sharp = require('sharp');
+      const metadata = await sharp(candidatePath).metadata();
+      return Boolean(metadata.width && metadata.height);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  getPlanningTextService() {
+    // Reuse the AI video generator's Gemini client for planner queries when available.
+    if (this.aiVideoGenerator && this.aiVideoGenerator.gemini) {
+      return {
+        isAvailable: () => true,
+        generateText: async (prompt, options = {}) => {
+          const model = process.env.GEMINI_TEXT_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+          const response = await this.aiVideoGenerator.gemini.models.generateContent({
+            model,
+            contents: prompt,
+            config: { maxOutputTokens: options.maxTokens || 400, temperature: options.temperature ?? 0.4 }
+          });
+          return response.text || '';
+        }
+      };
+    }
+    return null;
   }
 
   async simulateVideoAssembly(productionData, reason = null) {

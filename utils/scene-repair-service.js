@@ -71,11 +71,15 @@ function durationSeconds(value, fallback = 60) {
 }
 
 function buildInitialSceneManifest(production = {}, providerResult = {}) {
-  const blueprints = scriptScenes(production.script || {});
+  // Legacy/failed rows may carry a string (or absent) script instead of the
+  // normalized object — degrade to an empty manifest instead of crashing the
+  // API process.
+  const script = typeof production.script === 'object' && production.script !== null ? production.script : {};
+  const blueprints = scriptScenes(script);
   const totalDuration = durationSeconds(production.estimatedDuration || production.assets?.finalVideo?.duration, Math.max(30, blueprints.length * 8));
   const wordCounts = blueprints.map(scene => Math.max(8, scene.scriptText.trim().split(/\s+/).filter(Boolean).length));
   const totalWords = wordCounts.reduce((sum, count) => sum + count, 0);
-  const generated = providerResult.scenes || [];
+  const generated = Array.isArray(providerResult?.scenes) ? providerResult.scenes : [];
   const visualAssets = (production.assets?.video?.visualAssets || []).filter(Boolean);
   const audio = production.assets?.audio || {};
   const narrationStatus = audio.intentionalSilence === true

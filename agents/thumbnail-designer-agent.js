@@ -99,10 +99,17 @@ class ThumbnailDesignerAgent {
       }
     };
 
-    const baseConcept = concepts[script.metadata?.strategy?.contentType?.toLowerCase()] || concepts.explainer;
+    // Content-type aware concept: the classifier's thumbnailStrategy wins;
+    // legacy 5-format contentType keys still work unchanged.
+    const classification = script.metadata?.strategy?.classification;
+    const typeConcept = classification ? this.conceptForType(classification) : null;
+    const baseConcept = typeConcept
+      || concepts[script.metadata?.strategy?.contentType?.toLowerCase()]
+      || concepts.explainer;
+    const maxTextWords = typeConcept?.maxTextWords || 5;
     
     return {
-      title: this.formatThumbnailTitle(script.title),
+      title: this.formatThumbnailTitle(script.title, maxTextWords),
       style: baseConcept.style,
       primaryText: this.extractPrimaryText(script.title),
       secondaryText: this.generateSecondaryText(script),
@@ -118,13 +125,66 @@ class ThumbnailDesignerAgent {
     };
   }
 
-  formatThumbnailTitle(title) {
-    // Shorten title for thumbnail
-    const words = title.split(' ');
-    if (words.length > 5) {
-      return words.slice(0, 5).join(' ') + '...';
+  formatThumbnailTitle(title, maxWords = 5) {
+    // Shorten title for thumbnail (content type may cap it tighter)
+    const words = String(title || '').split(' ');
+    const cap = Math.max(2, Number(maxWords) || 5);
+    if (words.length > cap) {
+      return words.slice(0, cap).join(' ') + '...';
     }
     return title;
+  }
+
+  /**
+   * Map a 30-type classification to a thumbnail concept using its
+   * thumbnailStrategy (layout, palette, maxTextWords, accent).
+   */
+  conceptForType(classification) {
+    const strategy = classification?.thumbnailStrategy;
+    if (!strategy) return null;
+    const palettes = {
+      'news-red': ['#e53935', '#111318', '#ffffff'],
+      'sec-red': ['#ff5252', '#0b0b12', '#ffffff'],
+      'rank-gold': ['#f6b73c', '#141414', '#ffffff'],
+      'pop-yellow': ['#ffd54f', '#101010', '#111318'],
+      'tech-cyan': ['#26c6da', '#0d1520', '#ffffff'],
+      'ai-violet': ['#7c4dff', '#120a24', '#ffffff'],
+      'lab-green': ['#66bb6a', '#0e1a12', '#ffffff'],
+      'money-green': ['#43a047', '#0c1a10', '#ffffff'],
+      'review-orange': ['#fb8c00', '#171310', '#ffffff'],
+      'app-blue': ['#42a5f5', '#0e1620', '#ffffff'],
+      'guide-green': ['#4caf50', '#0f1a10', '#ffffff'],
+      'warn-amber': ['#ffb300', '#1a1408', '#111318'],
+      'film-teal': ['#26a69a', '#0c1719', '#ffffff'],
+      'noir': ['#9e9e9e', '#0a0a0a', '#ffffff'],
+      'blood-dark': ['#b71c1c', '#070608', '#ffffff'],
+      'neon': ['#00e5ff', '#05070f', '#ff2ea6'],
+      'sunset': ['#ff7043', '#1c0f14', '#ffe0b2'],
+      'dawn-gold': ['#ffca28', '#151208', '#ffffff'],
+      'duo-split': ['#ab47bc', '#101018', '#ffffff'],
+      'editorial-navy': ['#3949ab', '#0c0f1d', '#ffffff'],
+      'case-blue': ['#1e88e5', '#0a1220', '#ffffff'],
+      'host-red': ['#ef5350', '#140b0b', '#ffffff'],
+      'shorts-neon': ['#ff005d', '#0a0510', '#00e5ff'],
+      'trend-purple': ['#8e24aa', '#120818', '#ffffff'],
+      'warm-film': ['#ff8a65', '#160f0c', '#ffffff'],
+      'trust-blue': ['#1e88e5', '#0b1220', '#ffffff'],
+      'deep-indigo': ['#5c6bc0', '#0d0f1e', '#ffffff'],
+      'cinematic': ['#455a64', '#0b0e10', '#ffffff'],
+      'vibrant': ['#d500f9', '#0e0614', '#ffffff'],
+      'alert': ['#e53935', '#120808', '#ffd54f'],
+      'bold': ['#fdd835', '#101010', '#111318'],
+      'neutral': ['#90a4ae', '#101418', '#ffffff']
+    };
+    const palette = palettes[strategy.accent] || ['#4a90d9', '#0f1420', '#ffffff'];
+    return {
+      style: strategy.layout || 'bold',
+      elements: strategy.elements || ['strong subject', 'contrast'],
+      colors: palette,
+      emotion: strategy.emotion || 'engaging',
+      layout: strategy.layout,
+      maxTextWords: strategy.maxTextWords
+    };
   }
 
   extractPrimaryText(title) {

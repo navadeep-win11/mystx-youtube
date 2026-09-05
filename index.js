@@ -298,6 +298,26 @@ class YouTubeAutomationAgent {
       }
     }
 
+    // Optional content-type override (30-type registry). Folded into
+    // strategyContext so it survives job persistence and reaches the
+    // classifier as an explicit operator decision.
+    if (body.contentType !== undefined && body.contentType !== null) {
+      if (typeof body.contentType !== 'string') {
+        return { valid: false, status: 400, error: 'contentType must be a string' };
+      }
+      const requested = body.contentType.trim();
+      if (requested.length > 50) {
+        return { valid: false, status: 400, error: 'contentType must be 50 characters or less' };
+      }
+      const { resolveContentType, listContentTypeIds } = require('./utils/content-types');
+      const resolved = resolveContentType(requested);
+      if (!resolved) {
+        return { valid: false, status: 400, error: `contentType must be one of: ${listContentTypeIds({ includeCustom: false }).join(', ')}` };
+      }
+      value.strategyContext = value.strategyContext || {};
+      value.strategyContext.contentType = resolved.id;
+    }
+
     return { valid: true, value };
   }
 
@@ -408,8 +428,8 @@ class YouTubeAutomationAgent {
           return res.status(validation.status).json({ success: false, error: validation.error });
         }
 
-        const { topic, style, length } = validation.value;
-        const result = await this.startGenerationJob({ topic, style, length, source: 'manual' });
+        const { topic, style, length, contentType } = validation.value;
+        const result = await this.startGenerationJob({ topic, style, length, contentType, source: 'manual' });
         res.status(202).json({ success: true, result });
       } catch (error) {
         res.status(error.status || 500).json({ success: false, error: error.message });
@@ -1435,6 +1455,22 @@ class YouTubeAutomationAgent {
       generated.researchSources = Array.isArray(strategyContext.researchSources)
         ? strategyContext.researchSources
         : [];
+      // Content-type classification (30-type registry). Determines the visual,
+      // narration, editing, caption, thumbnail and SEO strategies used by the
+      // production pipeline. Operator-provided contentType always wins.
+      try {
+        const { ContentClassifier } = require('./utils/content-classifier');
+        const classifier = new ContentClassifier();
+        generated.classification = await classifier.classify({
+          topic: generated.topic || topic,
+          instructions: strategyContext.angle || null,
+          audience: strategyContext.audience || null,
+          channelStyle: profile.default_style || null,
+          explicitType: strategyContext.contentType || null
+        });
+      } catch (classificationError) {
+        this.logger.warn('Content classification failed; production falls back to legacy format:', classificationError.message);
+      }
       return generated;
     });
     this.logger.info(`Strategy generated: ${strategy.topic}`);
@@ -1647,8 +1683,11 @@ class YouTubeAutomationAgent {
   decorateContentBundle(bundle) {
     const experiment = bundle.editorData?.packagingExperiment;
     const sceneLabels = new Map((bundle.scenes || []).map(scene => [scene.id, scene.label]));
-    return {
+    const classification = bundle.strategy?.classification || bundle.assets?.classification || null;
+    const decorated = {
       ...bundle,
+      contentType: bundle.contentType || classification?.contentType || (bundle.assets?.visualPlan ? 'professional' : null),
+      aspectRatio: bundle.aspectRatio || classification?.aspectRatio || null,
       scenes: (bundle.scenes || []).map(scene => this.scenes
         ? this.scenes.decorateScene(scene, bundle.id)
         : scene),
@@ -1670,6 +1709,7 @@ class YouTubeAutomationAgent {
         script: bundle.assets?.script?.originalPath ? `/api/content/${bundle.id}/asset/script` : null
       }
     };
+    return decorated;
   }
 
   async refreshContentReview(productionId, reviewNotes) {

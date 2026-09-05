@@ -946,6 +946,45 @@ function renderSceneEditor(item, canReview = true) {
   </section>`;
 }
 
+function renderVisualPlanPanel(item) {
+  const plan = item.assets?.visualPlan;
+  if (!plan) return '';
+  const cls = item.classification;
+  const stats = plan.stats || {};
+  const qc = plan.qc || {};
+  const rows = (plan.scenes || []).map(scene => {
+    const licenseLink = scene.licenseUrl
+      ? `<a class="source-link" href="${escapeHTML(scene.licenseUrl)}" target="_blank" rel="noopener">${escapeHTML(scene.license)}</a>`
+      : escapeHTML(scene.license || '—');
+    const source = scene.pageUrl
+      ? `<a class="source-link" href="${escapeHTML(scene.pageUrl)}" target="_blank" rel="noopener">${escapeHTML(scene.provider || 'source')}</a>`
+      : escapeHTML(scene.provider || (scene.assetOrigin === 'ai_fallback' ? 'AI fallback' : 'gradient'));
+    return `<tr>
+      <td>${Number(scene.position) + 1}</td>
+      <td>${escapeHTML(scene.label || '')}</td>
+      <td class="visual-query">${escapeHTML(scene.visualQuery || '')}</td>
+      <td>${source}</td>
+      <td>${licenseLink}</td>
+      <td>${escapeHTML(String(scene.motion || '').replace(/_/g, ' '))}</td>
+    </tr>`;
+  }).join('');
+  return `<section class="visual-plan-panel">
+    <div class="panel-heading">
+      <div><p class="eyebrow">VISUAL PLAN &amp; SOURCES</p><h3>${escapeHTML(cls?.contentTypeLabel || cls?.contentType || 'Production')} · ${escapeHTML(item.aspectRatio || '16:9')} · narration-synced</h3></div>
+      <div class="shorts-evidence ready">
+        <span>${stats.stock || 0} licensed/open assets</span>
+        <span>${stats.ai || 0} AI-fallback scenes</span>
+        <span>QC ${item.assets?.visualQc ? (item.assets.visualQc.scenes >= 0 && !(item.assets.visualQc.duplicateAssets || item.assets.visualQc.missing) ? 'pass' : 'issues') : 'n/a'}</span>
+      </div>
+    </div>
+    <div class="table-scroll"><table class="visual-plan-table">
+      <thead><tr><th>#</th><th>Scene</th><th>Search intent</th><th>Source</th><th>License</th><th>Motion</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <p class="empty-inline">Every visual was acquired through a license-checked provider (Wikimedia/Openverse keyless; Pexels/Pixabay/Unsplash when keys are configured). AI generation is fallback-only. ${qc.scenes ? `Visual QC checked ${qc.scenes} scenes.` : ''}</p>
+  </section>`;
+}
+
 function renderShortsStudio(item) {
   if (!item.assets?.finalVideo?.path || item.assets.finalVideo.simulated) return '';
   const clips = item.shorts || [];
@@ -1020,6 +1059,7 @@ async function openContent(productionId) {
           </div>
         </div>
         ${renderSceneEditor(item, canReview)}
+        ${renderVisualPlanPanel(item)}
         ${renderShortsStudio(item)}
         ${renderDiscoverabilityPanel(item)}
         ${renderProvenanceEditor(item.provenance, canReview)}

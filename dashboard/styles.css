@@ -1042,3 +1042,12 @@ body.scrolled .topbar { border-color: rgba(151, 167, 195, .32); }
 .comment-card { border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: grid; gap: 8px; margin-bottom: 12px; }
 .comment-original { opacity: 0.8; font-size: 0.9rem; white-space: pre-wrap; margin: 0; }
 .comment-card textarea { width: 100%; min-height: 72px; resize: vertical; }
+
+/* Visual Plan & Sources panel (professional pipeline) */
+.visual-plan-panel { margin-top: 18px; border: 1px solid rgba(255, 255, 255, .07); border-radius: 12px; padding: 16px; background: rgba(255, 255, 255, .02); }
+.visual-plan-panel .panel-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
+.table-scroll { overflow-x: auto; }
+.visual-plan-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.visual-plan-table th { text-align: left; color: var(--muted, #8892a6); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, .08); white-space: nowrap; }
+.visual-plan-table td { padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, .04); vertical-align: top; }
+.visual-plan-table .visual-query { color: var(--muted, #8892a6); font-style: italic; }

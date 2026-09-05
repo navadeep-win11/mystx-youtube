@@ -63,6 +63,13 @@ class SystemTest {
       { name: 'Reply Approval and Posting', test: () => this.testReplyApprovalAndPosting() },
       { name: 'Engagement AI Provider Wiring', test: () => this.testEngagementAIProviderWiring() },
       { name: 'Engagement Sync Schedule', test: () => this.testEngagementSyncSchedule() },
+      { name: 'Content Type Registry (30 types)', test: () => this.testContentTypeRegistry() },
+      { name: 'Content Classifier Strategies', test: () => this.testContentClassifier() },
+      { name: 'Caption Engine Single-Layer Rules', test: () => this.testCaptionEngine() },
+      { name: 'Visual Search License + SSRF Guards', test: () => this.testVisualSearchGuards() },
+      { name: 'Visual Planner B-Roll Distribution', test: () => this.testVisualPlanner() },
+      { name: 'Visual QC Issue Detection', test: () => this.testVisualQC() },
+      { name: 'Duration Probe (ffprobe)', test: () => this.testDurationProbe() },
       { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() }
     ];
 
@@ -2490,13 +2497,13 @@ class SystemTest {
       if (embeddedAssets.length !== stills.length || embeddedAssets.some(asset => !asset.startsWith('data:image/png;base64,'))) {
         throw new Error('Slideshow image assets were not embedded as browser-safe image data');
       }
-      const { chromium } = require('playwright');
       let browser = null;
       try {
+        const { chromium } = require('playwright');
         browser = await chromium.launch();
       } catch (error) {
-        if (!/Executable doesn't exist|playwright install/i.test(error.message)) throw error;
-        this.logger.warn('Chromium is not installed — verified browser-safe image embedding without the live browser assertion');
+        if (!/Executable doesn't exist|playwright install|Unsupported platform/i.test(error.message)) throw error;
+        this.logger.warn('Chromium is unavailable (not installed or unsupported platform) — verified browser-safe image embedding without the live browser assertion');
       }
       if (browser) {
         try {
@@ -3214,8 +3221,12 @@ class SystemTest {
     // (manager.credentials), the shape the walkthrough writes to credentials.json.
     // Passing the CredentialManager itself leaves the engagement studio permanently
     // in fallback mode on installs with no provider environment variables.
-    const savedEnv = process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_API_KEY;
+    const providerEnvKeys = ['OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GEMINI_API_KEY', 'MOONSHOT_API_KEY', 'MIMO_API_KEY', 'GLM_API_KEY'];
+    const savedEnv = {};
+    for (const key of providerEnvKeys) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
     try {
       const configured = new AITextService({
         aiProvider: { provider: 'openai', apiKey: 'test-key', model: 'gpt-5.6' }
@@ -3231,8 +3242,10 @@ class SystemTest {
         throw new Error('A CredentialManager-shaped argument must not look configured; index.js has to unwrap it');
       }
     } finally {
-      if (savedEnv === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = savedEnv;
+      for (const key of providerEnvKeys) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
     }
   }
 
@@ -3288,6 +3301,142 @@ class SystemTest {
     }
     const noService = new DailyAutomation({}, {}, {});
     await noService.refreshGrowthExperiments();
+  }
+
+
+  // ==================== Professional pipeline tests ====================
+
+  async testContentTypeRegistry() {
+    const { CONTENT_TYPES, resolveContentType, listContentTypeIds } = require('./utils/content-types');
+    const ids = listContentTypeIds({ includeCustom: true });
+    if (ids.length < 30) throw new Error(`expected at least 30 content types, got ${ids.length}`);
+    for (const id of ids) {
+      const type = CONTENT_TYPES[id];
+      if (!type.label) throw new Error(`${id} missing label`);
+      if (!type.visualStrategy || !type.visualStrategy.preferredAssetTypes) throw new Error(`${id} missing visualStrategy`);
+      if (!type.narrationStyle || !type.pacingStyle) throw new Error(`${id} missing narration/pacing strategies`);
+      if (!type.editingStyle || !Array.isArray(type.editingStyle.overlays)) throw new Error(`${id} missing editingStyle.overlays`);
+      if (!type.thumbnailStrategy || !type.seoStrategy) throw new Error(`${id} missing thumbnail/seo strategies`);
+    }
+    if (!resolveContentType('top 10') || resolveContentType('top 10').id !== 'listicle') throw new Error('alias top 10 must resolve to listicle');
+    if (resolveContentType('totally-bogus-type') !== null) throw new Error('unknown ids must resolve to null (typo safety)');
+    if (resolveContentType(null).id !== 'custom') throw new Error('null must resolve to custom');
+    this.logger.info(`Content types: ${ids.length} registered, aliases resolve, unknown → null`);
+  }
+
+  async testContentClassifier() {
+    const { ContentClassifier, heuristicClassify } = require('./utils/content-classifier');
+    const cases = [
+      [{ topic: 'Top 10 phishing scams of 2025' }, 'listicle'],
+      [{ topic: 'How hackers breach bank servers' }, 'cybersecurity'],
+      [{ topic: 'New AI model released today' }, 'news']
+    ];
+    for (const [input, expected] of cases) {
+      const result = heuristicClassify(input);
+      if (result.typeId !== expected) throw new Error(`heuristic classify(${JSON.stringify(input)}) = ${result.typeId}, expected ${expected}`);
+    }
+    const overridden = await new ContentClassifier().classify({ topic: 'Top 10 phishing scams', explicitType: 'tutorial' });
+    if (overridden.typeId !== 'tutorial' || overridden.classifier !== 'operator') {
+      throw new Error(`operator override ignored (got ${overridden.typeId} via ${overridden.classifier})`);
+    }
+    if (!overridden.editingStyle || !overridden.aspectRatio) throw new Error('classification missing strategies');
+    this.logger.info('Classifier: heuristics + operator override verified');
+  }
+
+  async testCaptionEngine() {
+    const { CaptionEngine } = require('./utils/captions');
+    const engine = new CaptionEngine();
+    const text = 'Ransomware does not announce itself. It waits quietly, then encrypts every file it can reach, and finally demands a payment you cannot afford to lose.';
+    const { events, validation } = engine.buildSceneCaptions(text, 14, { granularity: 'phrase', aspectRatio: '16:9' });
+    if (!events.length) throw new Error('no caption events produced');
+    if (!validation.ok) throw new Error(`caption validation failed: ${JSON.stringify(validation.issues)}`);
+    for (let i = 1; i < events.length; i++) {
+      if (events[i].start < events[i - 1].end - 0.001) throw new Error('overlapping caption events detected');
+    }
+    if (events[events.length - 1].end > 14.05) throw new Error('caption exceeds scene duration');
+    const broken = [
+      { start: 0, end: 3, text: 'same text' },
+      { start: 1, end: 4, text: 'same text' },
+      { start: 2, end: 5, text: 'another' }
+    ];
+    const verdict = engine.validate(broken);
+    if (verdict.ok) throw new Error('validator accepted overlapping + duplicate captions');
+    const repaired = engine.repair(broken, 6);
+    const after = engine.validate(repaired);
+    if (!after.ok) throw new Error(`repair failed: ${JSON.stringify(after.issues)}`);
+    const srt = engine.toSRT(events);
+    if (!/\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}/.test(srt)) throw new Error('SRT timestamp format invalid');
+    this.logger.info(`Caption engine: ${events.length} valid events, overlap/dup detection + repair verified`);
+  }
+
+  async testVisualSearchGuards() {
+    const { VisualSearchEngine, licenseAccepted, PROVIDER_DOWNLOAD_HOSTS } = require('./utils/visual-search');
+    const engine = new VisualSearchEngine({ cache: { root: '/tmp-unused' } });
+    if (!licenseAccepted('CC BY-SA 4.0')) throw new Error('CC BY-SA 4.0 must be accepted');
+    if (!licenseAccepted('Pexels License')) throw new Error('Pexels License must be accepted');
+    if (licenseAccepted('arr-see-all-rights-reserved')) throw new Error('all-rights-reserved licenses must be rejected');
+    if (licenseAccepted(null) || licenseAccepted('')) throw new Error('missing license must be rejected');
+    const fake = { provider: 'wikimedia', downloadUrl: 'http://evil.example.com/x.jpg' };
+    if (engine.isSafeDownload(fake)) throw new Error('http:// URL passed the SSRF guard');
+    if (engine.isSafeDownload({ provider: 'wikimedia', downloadUrl: 'https://evil.example.com/x.jpg' })) throw new Error('unknown host passed the SSRF guard');
+    if (!engine.isSafeDownload({ provider: 'wikimedia', downloadUrl: 'https://thumb.wikimedia.org/x.jpg' })) throw new Error('legit wikimedia host rejected');
+    if (!PROVIDER_DOWNLOAD_HOSTS.wikimedia.includes('upload.wikimedia.org')) throw new Error('upload host missing');
+    this.logger.info('Visual search: license allowlist + SSRF host guards verified');
+  }
+
+  async testVisualPlanner() {
+    const { VisualPlanner } = require('./utils/visual-planner');
+    const { CONTENT_TYPES } = require('./utils/content-types');
+    const planner = new VisualPlanner({});
+    const strategy = CONTENT_TYPES.listicle.visualStrategy;
+    const total = 10;
+    const wantVideo = [];
+    for (let i = 0; i < total; i++) wantVideo.push(planner.sceneWantsVideo(i, total, strategy));
+    const videoCount = wantVideo.filter(Boolean).length;
+    const expected = Math.round(total * strategy.bRollRatio);
+    if (Math.abs(videoCount - expected) > 1) throw new Error(`b-roll distribution off: ${videoCount} video slots for ratio ${strategy.bRollRatio} (expected ~${expected})`);
+    const motionA = planner.motionForScene(0, strategy, 'image');
+    const motionB = planner.motionForScene(1, strategy, 'image');
+    if (motionA === motionB) throw new Error('consecutive scenes share identical motion (monotonous cut risk)');
+    this.logger.info(`Visual planner: ${videoCount}/${total} b-roll slots, alternating motion (${motionA}/${motionB})`);
+  }
+
+  async testVisualQC() {
+    const { VisualQC } = require('./utils/visual-qc');
+    const qc = new VisualQC({});
+    const plan = {
+      scenes: [
+        { position: 0, assetOrigin: 'stock', assetPath: 'a.png', provider: 'wikimedia', license: 'CC0', cacheHash: 'h1' },
+        { position: 1, assetOrigin: 'stock', assetPath: 'a.png', provider: 'wikimedia', license: 'CC0', cacheHash: 'h1' },
+        { position: 2, assetOrigin: 'stock', assetPath: 'b.info' }
+      ]
+    };
+    const result = await qc.validatePlan(plan, { scenes: [{ duration: 5, audioPath: 'x.mp3', realAudio: true }] });
+    if (result.ok) throw new Error('QC missed duplicate-visual and broken-media issues');
+    const codes = Object.values(result.sceneIssues).flat();
+    if (!codes.includes('duplicate_visual')) throw new Error('duplicate_visual not detected');
+    if (!codes.includes('missing_asset_file')) throw new Error('missing_asset_file not detected for nonexistent .info path');
+    if (!codes.some(code => code.startsWith('incomplete_license_metadata'))) throw new Error('missing license metadata not detected');
+    this.logger.info('Visual QC: duplicates, broken media, license metadata detection verified');
+  }
+
+  async testDurationProbe() {
+    const { probeMediaDuration } = require('./utils/ffmpeg');
+    const fs = require('fs').promises;
+    const { execFile } = require('child_process');
+    const { promisify } = require('util');
+    await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
+    const dir = await fs.mkdtemp(path.join(__dirname, 'data', 'probe-test-'));
+    try {
+      await promisify(execFile)('ffmpeg', ['-y', '-f', 'lavfi', '-i', 'sine=frequency=300:duration=2.5', path.join(dir, 'a.mp3')]);
+      const duration = await probeMediaDuration(path.join(dir, 'a.mp3'));
+      if (!duration || Math.abs(duration - 2.5) > 0.3) throw new Error(`probed duration ${duration}, expected ~2.5`);
+      const missing = await probeMediaDuration(path.join(dir, 'missing.mp3'));
+      if (missing !== null) throw new Error('missing file must probe to null');
+      this.logger.info(`Duration probe: mp3 = ${duration}s, missing = null`);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
